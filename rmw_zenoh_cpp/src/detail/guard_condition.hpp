@@ -17,6 +17,7 @@
 #define DETAIL__GUARD_CONDITION_HPP_
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #include "rmw_wait_set_data.hpp"
@@ -39,7 +40,7 @@ public:
 private:
   mutable std::mutex internal_mutex_;
   bool has_triggered_;
-  rmw_wait_set_data_t * wait_set_data_;
+  std::shared_ptr<rmw_wait_set_data_t> wait_set_data_;
 };
 }  // namespace rmw_zenoh_cpp
 

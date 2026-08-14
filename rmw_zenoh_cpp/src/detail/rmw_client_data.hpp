@@ -138,7 +138,7 @@ private:
   // Deque to store the replies in the order they arrive.
   std::deque<std::unique_ptr<rmw_zenoh_cpp::ZenohReply>> reply_queue_;
   // Wait set data.
-  rmw_wait_set_data_t * wait_set_data_;
+  std::shared_ptr<rmw_wait_set_data_t> wait_set_data_;
   // Data callback manager.
   DataCallbackManager data_callback_mgr_;
   // Sequence number for queries.

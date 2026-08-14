@@ -156,7 +156,7 @@ private:
   // Per-subscriber reception sequence number counter, incremented on every take.
   std::atomic<uint64_t> reception_sn_;
   // Wait set data.
-  rmw_wait_set_data_t * wait_set_data_;
+  std::shared_ptr<rmw_wait_set_data_t> wait_set_data_;
   // Callback managers.
   DataCallbackManager data_callback_mgr_;
   std::shared_ptr<EventsManager> events_mgr_;

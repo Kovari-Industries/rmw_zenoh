@@ -152,7 +152,7 @@ SubscriptionData::SubscriptionData(
   sub_options_(std::move(sub_options)),
   last_known_published_msg_({}),
   reception_sn_(0),
-  wait_set_data_(nullptr),
+  
   is_shutdown_(false),
   initialized_(false)
 {
@@ -365,7 +365,7 @@ bool SubscriptionData::queue_has_data_and_attach_condition_if_not(
     return true;
   }
 
-  wait_set_data_ = wait_set_data;
+  wait_set_data_ = wait_set_data->shared_from_this();
 
   return false;
 }
@@ -374,7 +374,7 @@ bool SubscriptionData::queue_has_data_and_attach_condition_if_not(
 bool SubscriptionData::detach_condition_and_queue_is_empty()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  wait_set_data_ = nullptr;
+  wait_set_data_.reset();
 
   return message_queue_.empty();
 }
@@ -497,7 +497,11 @@ rmw_ret_t SubscriptionData::take_serialized_message(
 void SubscriptionData::add_new_message(
   std::unique_ptr<SubscriptionData::Message> msg, const std::string & topic_name)
 {
-  rmw_wait_set_data_t * wait_set_data_to_trigger = nullptr;
+  // shared_ptr, not raw: the notify runs outside this entity's own mutex (the
+  // deadlock-avoidance ordering with rmw_wait), so only holding a reference
+  // keeps the wait set's condition_mutex alive if rmw_destroy_wait_set races
+  // this notify on another thread.
+  std::shared_ptr<rmw_wait_set_data_t> wait_set_data_to_trigger;
   bool message_lost = false;
   int32_t num_msg_lost = 0;
 
@@ -561,7 +565,7 @@ void SubscriptionData::add_new_message(
       std::move(num_msg_lost));
   }
 
-  if (wait_set_data_to_trigger != nullptr) {
+  if (wait_set_data_to_trigger) {
     std::lock_guard<std::mutex> wait_set_lock(wait_set_data_to_trigger->condition_mutex);
     wait_set_data_to_trigger->triggered = true;
     wait_set_data_to_trigger->condition_variable.notify_one();

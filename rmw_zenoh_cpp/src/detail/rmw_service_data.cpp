@@ -235,7 +235,11 @@ bool ServiceData::liveliness_is_valid() const
 ///=============================================================================
 void ServiceData::add_new_query(std::unique_ptr<ZenohQuery> query)
 {
-  rmw_wait_set_data_t * wait_set_data_to_trigger = nullptr;
+  // shared_ptr, not raw: the notify runs outside this entity's own mutex (the
+  // deadlock-avoidance ordering with rmw_wait), so only holding a reference
+  // keeps the wait set's condition_mutex alive if rmw_destroy_wait_set races
+  // this notify on another thread.
+  std::shared_ptr<rmw_wait_set_data_t> wait_set_data_to_trigger;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (is_shutdown_.load(std::memory_order_acquire)) {
@@ -266,7 +270,7 @@ void ServiceData::add_new_query(std::unique_ptr<ZenohQuery> query)
     wait_set_data_to_trigger = wait_set_data_;
   }
 
-  if (wait_set_data_to_trigger != nullptr) {
+  if (wait_set_data_to_trigger) {
     std::lock_guard<std::mutex> wait_set_lock(wait_set_data_to_trigger->condition_mutex);
     wait_set_data_to_trigger->triggered = true;
     wait_set_data_to_trigger->condition_variable.notify_one();
@@ -495,7 +499,7 @@ bool ServiceData::queue_has_data_and_attach_condition_if_not(
   if (!query_queue_.empty()) {
     return true;
   }
-  wait_set_data_ = wait_set_data;
+  wait_set_data_ = wait_set_data->shared_from_this();
 
   return false;
 }
@@ -504,7 +508,7 @@ bool ServiceData::queue_has_data_and_attach_condition_if_not(
 bool ServiceData::detach_condition_and_queue_is_empty()
 {
   std::lock_guard<std::mutex> lock(mutex_);
-  wait_set_data_ = nullptr;
+  wait_set_data_.reset();
 
   return query_queue_.empty();
 }

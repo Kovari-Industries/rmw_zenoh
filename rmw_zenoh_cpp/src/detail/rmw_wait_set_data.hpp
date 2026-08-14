@@ -16,6 +16,7 @@
 #define DETAIL__RMW_WAIT_SET_DATA_HPP_
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 
 #include "rmw/rmw.h"
@@ -23,7 +24,13 @@
 namespace rmw_zenoh_cpp
 {
 
-struct rmw_wait_set_data_t
+// Owned through std::shared_ptr (rmw_create_wait_set make_shared's it, and each
+// entity keeps a shared_ptr while attached): an rx thread that has already
+// copied the pointer for a notify keeps condition_mutex alive even if
+// rmw_destroy_wait_set runs concurrently. Locking a destroyed mutex is what
+// the raw-pointer version did, and under MALLOC_PERTURB_ it aborts with
+// "___pthread_mutex_lock: assertion failed: mutex->__data.__owner == 0".
+struct rmw_wait_set_data_t : std::enable_shared_from_this<rmw_wait_set_data_t>
 {
   // The combination of condition_variable, condition_mutex, and triggered are used to make sure
   // there isn't a race in rmw_wait().  That could happen because of the following sequence:

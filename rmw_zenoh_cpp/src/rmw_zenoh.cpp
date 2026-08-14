@@ -2025,8 +2025,15 @@ rmw_create_wait_set(rmw_context_t * context, size_t max_conditions)
 
   wait_set->implementation_identifier = rmw_zenoh_cpp::rmw_zenoh_identifier;
 
+  // wait_set->data holds a shared_ptr to the data, not the data itself. The
+  // entities keep their own shared_ptr copies while attached, so a notify
+  // running on a zenoh rx thread can never lock a condition_mutex whose
+  // owning struct has been destroyed underneath it: rmw_destroy_wait_set only
+  // drops this reference, and the struct lives until the last in-flight
+  // notify lets go. See rmw_wait_set_data.hpp.
+  using WaitSetDataPtr = std::shared_ptr<rmw_zenoh_cpp::rmw_wait_set_data_t>;
   wait_set->data = allocator->zero_allocate(
-    1, sizeof(rmw_zenoh_cpp::rmw_wait_set_data_t),
+    1, sizeof(WaitSetDataPtr),
     allocator->state);
   RMW_CHECK_FOR_NULL_WITH_MSG(
     wait_set->data,
@@ -2038,15 +2045,15 @@ rmw_create_wait_set(rmw_context_t * context, size_t max_conditions)
     });
 
   // Invoke placement new
-  new(wait_set->data) rmw_zenoh_cpp::rmw_wait_set_data_t;
+  new(wait_set->data) WaitSetDataPtr(std::make_shared<rmw_zenoh_cpp::rmw_wait_set_data_t>());
   auto destruct_rmw_wait_set_data = rcpputils::make_scope_exit(
     [wait_set]() {
       RMW_TRY_DESTRUCTOR_FROM_WITHIN_FAILURE(
-        static_cast<rmw_zenoh_cpp::rmw_wait_set_data_t *>(wait_set->data)->~rmw_wait_set_data_t(),
+        static_cast<WaitSetDataPtr *>(wait_set->data)->~WaitSetDataPtr(),
         rmw_wait_set_data);
     });
 
-  static_cast<rmw_zenoh_cpp::rmw_wait_set_data_t *>(wait_set->data)->context = context;
+  (*static_cast<WaitSetDataPtr *>(wait_set->data))->context = context;
 
   destruct_rmw_wait_set_data.cancel();
   free_wait_set_data.cancel();
@@ -2068,12 +2075,15 @@ rmw_destroy_wait_set(rmw_wait_set_t * wait_set)
     rmw_zenoh_cpp::rmw_zenoh_identifier,
     return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
-  auto wait_set_data = static_cast<rmw_zenoh_cpp::rmw_wait_set_data_t *>(wait_set->data);
+  using WaitSetDataPtr = std::shared_ptr<rmw_zenoh_cpp::rmw_wait_set_data_t>;
+  auto wait_set_data_holder = static_cast<WaitSetDataPtr *>(wait_set->data);
 
-  rcutils_allocator_t * allocator = &wait_set_data->context->options.allocator;
+  rcutils_allocator_t * allocator = &(*wait_set_data_holder)->context->options.allocator;
 
-  wait_set_data->~rmw_wait_set_data_t();
-  allocator->deallocate(wait_set_data, allocator->state);
+  // Drops this reference only. If a zenoh rx thread is mid-notify with its own
+  // copy, the struct (and its condition_mutex) stays alive until it finishes.
+  wait_set_data_holder->~WaitSetDataPtr();
+  allocator->deallocate(wait_set->data, allocator->state);
 
   allocator->deallocate(wait_set, allocator->state);
 
@@ -2192,7 +2202,11 @@ rmw_wait(
     wait_set->implementation_identifier, rmw_zenoh_cpp::rmw_zenoh_identifier,
     return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
-  auto wait_set_data = static_cast<rmw_zenoh_cpp::rmw_wait_set_data_t *>(wait_set->data);
+  // The holder in wait_set->data keeps the struct alive for the whole call;
+  // the raw pointer below is only handed to attach methods, which take their
+  // own shared_ptr via shared_from_this().
+  auto wait_set_data =
+    static_cast<std::shared_ptr<rmw_zenoh_cpp::rmw_wait_set_data_t> *>(wait_set->data)->get();
   RMW_CHECK_FOR_NULL_WITH_MSG(
     wait_set_data,
     "waitset data struct is null",

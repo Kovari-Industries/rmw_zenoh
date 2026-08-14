@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <memory>
 #include <mutex>
 
 #include "guard_condition.hpp"
@@ -22,15 +23,18 @@ namespace rmw_zenoh_cpp
 {
 ///=============================================================================
 GuardCondition::GuardCondition()
-: has_triggered_(false),
-  wait_set_data_(nullptr)
+: has_triggered_(false)
 {
 }
 
 ///=============================================================================
 void GuardCondition::trigger()
 {
-  rmw_wait_set_data_t * wait_set_data_to_trigger = nullptr;
+  // A shared_ptr copy, not a raw pointer: the notify below runs outside
+  // internal_mutex_ (deadlock-avoidance with rmw_wait), so nothing else stops
+  // rmw_destroy_wait_set from destroying the struct first. Owning a reference
+  // for the duration of the notify is what keeps condition_mutex alive.
+  std::shared_ptr<rmw_wait_set_data_t> wait_set_data_to_trigger;
   {
     std::lock_guard<std::mutex> lock(internal_mutex_);
 
@@ -56,7 +60,7 @@ bool GuardCondition::check_and_attach_condition_if_not(rmw_wait_set_data_t * wai
     return true;
   }
 
-  wait_set_data_ = wait_set_data;
+  wait_set_data_ = wait_set_data->shared_from_this();
 
   return false;
 }
@@ -65,7 +69,7 @@ bool GuardCondition::check_and_attach_condition_if_not(rmw_wait_set_data_t * wai
 bool GuardCondition::detach_condition_and_is_trigger_set()
 {
   std::lock_guard<std::mutex> lock(internal_mutex_);
-  wait_set_data_ = nullptr;
+  wait_set_data_.reset();
 
   bool ret = has_triggered_;
 

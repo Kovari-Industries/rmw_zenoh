@@ -218,7 +218,7 @@ bool EventsManager::queue_has_data_and_attach_condition_if_not(
     return true;
   }
 
-  wait_set_data_[event_id] = wait_set_data;
+  wait_set_data_[event_id] = wait_set_data->shared_from_this();
 
   return false;
 }
@@ -236,7 +236,7 @@ bool EventsManager::detach_condition_and_event_queue_is_empty(rmw_zenoh_event_ty
 
   std::lock_guard<std::mutex> lock(event_condition_mutex_);
 
-  wait_set_data_[event_id] = nullptr;
+  wait_set_data_[event_id].reset();
 
   return !event_statuses_[event_id].changed;
 }
@@ -254,12 +254,14 @@ void EventsManager::notify_event(rmw_zenoh_event_type_t event_id)
 
   /* Make sure to not lock both event_mutex_ and event_condition_mutex_ at the same time to avoid
    * deadlocks with rmw_wait */
-  rmw_wait_set_data_t * wait_set_data = nullptr;
+  // shared_ptr copy so the notify below cannot lock a condition_mutex whose
+  // wait set was destroyed between releasing event_condition_mutex_ and here.
+  std::shared_ptr<rmw_wait_set_data_t> wait_set_data;
   {
     std::lock_guard<std::mutex> lock(event_condition_mutex_);
     wait_set_data = wait_set_data_[event_id];
   }
-  if (wait_set_data != nullptr) {
+  if (wait_set_data) {
     std::lock_guard<std::mutex> wait_set_lock(wait_set_data->condition_mutex);
     wait_set_data->triggered = true;
     wait_set_data->condition_variable.notify_one();
