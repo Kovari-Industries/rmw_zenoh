@@ -17,6 +17,7 @@
 #include <fastcdr/FastBuffer.h>
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <memory>
 #include <mutex>
@@ -44,6 +45,23 @@
 
 namespace rmw_zenoh_cpp
 {
+namespace
+{
+// Publishers on other threads commonly keep publishing between rmw_shutdown()
+// and process exit. Each of those publishes is dropped, which is harmless, so
+// warn once per process instead of once per message.
+void warn_session_closed_once()
+{
+  static std::atomic_bool warned{false};
+  if (!warned.exchange(true, std::memory_order_relaxed)) {
+    RMW_ZENOH_LOG_WARN_NAMED(
+      "rmw_zenoh_cpp",
+      "unable to publish message since the zenoh session is closed; "
+      "further messages dropped for this reason will not be logged");
+  }
+}
+}  // namespace
+
 // Period (ms) of heartbeats sent for detection of lost samples
 // by a RELIABLE + TRANSIENT_LOCAL Publisher
 #define SAMPLE_MISS_DETECTION_HEARTBEAT_PERIOD 500
@@ -334,9 +352,7 @@ rmw_ret_t PublisherData::publish(
   pub_.put(std::move(payload), std::move(opts), &result);
   if (result != Z_OK) {
     if (result == Z_ESESSION_CLOSED) {
-      RMW_ZENOH_LOG_WARN_NAMED(
-        "rmw_zenoh_cpp",
-        "unable to publish message since the zenoh session is closed");
+      warn_session_closed_once();
     } else {
       RMW_SET_ERROR_MSG("unable to publish message");
       return RMW_RET_ERROR;
@@ -421,9 +437,7 @@ rmw_ret_t PublisherData::publish_serialized_message(
 
   if (result != Z_OK) {
     if (result == Z_ESESSION_CLOSED) {
-      RMW_ZENOH_LOG_WARN_NAMED(
-        "rmw_zenoh_cpp",
-        "unable to publish message since the zenoh session is closed");
+      warn_session_closed_once();
     } else {
       RMW_SET_ERROR_MSG("unable to publish message");
       return RMW_RET_ERROR;

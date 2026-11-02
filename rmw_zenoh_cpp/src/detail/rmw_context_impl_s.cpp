@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <zenoh.hxx>
@@ -220,7 +221,13 @@ public:
         graph_cache_->parse_put(keystr);
         break;
       case zenoh::SampleKind::Z_SAMPLE_KIND_DELETE:
-        graph_cache_->parse_del(keystr);
+        {
+          std::lock_guard<std::mutex> lock(initial_query_mutex_);
+          if (deleted_during_initial_query_.has_value()) {
+            deleted_during_initial_query_->insert(keystr);
+          }
+          graph_cache_->parse_del(keystr);
+        }
         break;
       default:
         return;
@@ -437,52 +444,6 @@ private:
     // Initialize the graph cache.
     graph_cache_ =
       std::make_shared<rmw_zenoh_cpp::GraphCache>(this->session_->get_zid());
-    // Setup liveliness subscriptions for discovery.
-    // Query router/liveliness participants to get graph information before the session was started.
-    // We create a blocking channel that is unbounded, ie. `bound` = 0, to receive
-    // replies for the z_liveliness_get() call. This is necessary as if the `bound`
-    // is too low, the channel may starve the zenoh executor of its threads which
-    // would lead to deadlocks when trying to receive replies and block the
-    // execution here.
-    // The blocking channel will return when the sender end is closed which is
-    // the moment the query finishes.
-    // The non-blocking fifo exists only for the use case where we don't want to
-    // block the thread between responses (including the request termination response).
-    // In general, unless we want to cooperatively schedule other tasks on the same
-    // thread as reading the fifo, the blocking fifo will be more appropriate as
-    // the code will be simpler, and if we're just going to spin over the non-blocking
-    // reads until we obtain responses, we'll just be hogging CPU time by convincing
-    // the OS that we're doing actual work when it could instead park the thread.
-
-    // Intuitively use a FIFO channel rather than building it up with a closure and a
-    // handler to FIFO channel
-    zenoh::Session::GetOptions options = zenoh::Session::GetOptions::create_default();
-    options.target = zenoh::QueryTarget::Z_QUERY_TARGET_ALL;
-    options.payload = "";
-
-    auto replies = session_->liveliness_get(
-      liveliness_keyexpr_,
-      zenoh::channels::FifoChannel(SIZE_MAX - 1),
-      zenoh::Session::LivelinessGetOptions::create_default(),
-      &result);
-
-    if (result != Z_OK) {
-      throw std::runtime_error("Error getting liveliness. ");
-    }
-
-    for (auto res = replies.recv(); std::holds_alternative<zenoh::Reply>(res);
-      res = replies.recv())
-    {
-      const zenoh::Reply & reply = std::get<zenoh::Reply>(res);
-      if (reply.is_ok()) {
-        const auto & sample = reply.get_ok();
-        graph_cache_->parse_put(std::string(sample.get_keyexpr().as_string_view()), true);
-      } else {
-        RMW_ZENOH_LOG_DEBUG_NAMED(
-          "rmw_zenoh_cpp", "[rmw_context_impl_s] z_call received an invalid reply.\n");
-      }
-    }
-
     // Initialize the shm subsystem if shared_memory is enabled in the config
     if (shm_enabled) {
       RMW_ZENOH_LOG_DEBUG_NAMED("rmw_zenoh_cpp",
@@ -537,6 +498,78 @@ private:
       RMW_SET_ERROR_MSG("unable to create zenoh subscription");
       throw std::runtime_error("Unable to subscribe to ROS graph updates.");
     }
+
+    query_initial_graph();
+  }
+
+  // Query router/liveliness participants to get graph information before the session was started.
+  // This runs after graph_subscriber_ is declared. Declaring the subscriber
+  // afterwards missed the undeclaration of any token that went away between
+  // the two, leaving entities of exited processes in the graph cache.
+  // A reply may still be handled after the subscriber has processed the
+  // token's deletion, so replies for keys deleted meanwhile are dropped.
+  // Liveliness keys contain the session, node and entity ids, so a deleted
+  // key is never declared again.
+  void query_initial_graph()
+  {
+    {
+      std::lock_guard<std::mutex> lock(initial_query_mutex_);
+      deleted_during_initial_query_.emplace();
+    }
+    auto stop_tracking = rcpputils::make_scope_exit(
+      [this]() {
+        std::lock_guard<std::mutex> lock(initial_query_mutex_);
+        deleted_during_initial_query_.reset();
+      });
+
+    zenoh::ZResult result;
+    // We create a blocking channel that is unbounded, ie. `bound` = 0, to receive
+    // replies for the z_liveliness_get() call. This is necessary as if the `bound`
+    // is too low, the channel may starve the zenoh executor of its threads which
+    // would lead to deadlocks when trying to receive replies and block the
+    // execution here.
+    // The blocking channel will return when the sender end is closed which is
+    // the moment the query finishes.
+    // The non-blocking fifo exists only for the use case where we don't want to
+    // block the thread between responses (including the request termination response).
+    // In general, unless we want to cooperatively schedule other tasks on the same
+    // thread as reading the fifo, the blocking fifo will be more appropriate as
+    // the code will be simpler, and if we're just going to spin over the non-blocking
+    // reads until we obtain responses, we'll just be hogging CPU time by convincing
+    // the OS that we're doing actual work when it could instead park the thread.
+
+    // Intuitively use a FIFO channel rather than building it up with a closure and a
+    // handler to FIFO channel
+    zenoh::Session::GetOptions options = zenoh::Session::GetOptions::create_default();
+    options.target = zenoh::QueryTarget::Z_QUERY_TARGET_ALL;
+    options.payload = "";
+
+    auto replies = session_->liveliness_get(
+      liveliness_keyexpr_,
+      zenoh::channels::FifoChannel(SIZE_MAX - 1),
+      zenoh::Session::LivelinessGetOptions::create_default(),
+      &result);
+
+    if (result != Z_OK) {
+      throw std::runtime_error("Error getting liveliness. ");
+    }
+
+    for (auto res = replies.recv(); std::holds_alternative<zenoh::Reply>(res);
+      res = replies.recv())
+    {
+      const zenoh::Reply & reply = std::get<zenoh::Reply>(res);
+      if (reply.is_ok()) {
+        const auto & sample = reply.get_ok();
+        std::string keystr(sample.get_keyexpr().as_string_view());
+        std::lock_guard<std::mutex> lock(initial_query_mutex_);
+        if (deleted_during_initial_query_->count(keystr) == 0) {
+          graph_cache_->parse_put(keystr, true);
+        }
+      } else {
+        RMW_ZENOH_LOG_DEBUG_NAMED(
+          "rmw_zenoh_cpp", "[rmw_context_impl_s] z_call received an invalid reply.\n");
+      }
+    }
   }
 
   // Mutex to lock when accessing members.
@@ -578,6 +611,11 @@ private:
   std::unordered_map<const rmw_node_t *, std::shared_ptr<rmw_zenoh_cpp::NodeData>> nodes_;
 
   zenoh::KeyExpr liveliness_keyexpr_;
+  // Guards deleted_during_initial_query_. Held while updating the graph cache
+  // for a deletion or an initial query reply, so the two are ordered.
+  std::mutex initial_query_mutex_;
+  // Liveliness keys deleted while query_initial_graph() runs; empty otherwise.
+  std::optional<std::unordered_set<std::string>> deleted_during_initial_query_;
 };
 
 ///=============================================================================
